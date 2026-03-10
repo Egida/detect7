@@ -204,10 +204,9 @@ def process_record(ip):
             
             message_data = {
                 'ptr': ptr,
-                # "ptr": ip_records[0]['data']['ptr'],
-                # "timestamp": last_feature['timestamp'].iloc[0].timestamp(), # v 1.1
-                "timestamp": last_feature_flat['timestamp'], # v 1.0
+                "timestamp": last_feature_flat['timestamp'],
                 "domain": ip_data[0]['domain'],
+                "domain_id": ip_records[0]['data'].get('domain_id'),
                 "message": log_string,
                 "priority": EngineConfig.DETECTOR_WORKER_GRAYLOG_PRIORITY,
                 "tag": EngineConfig.DETECTOR_WORKER_GRAYLOG_TAG,
@@ -251,16 +250,21 @@ class QueueConsumer:
             queue=EngineConfig.RABBITMQ_CHALLENGE_QUEUE,
             routing_key=EngineConfig.RABBITMQ_CHALLENGE_ROUTING_KEY
         )
-        
         self.rabbitmq_client = RabbitMQ_Client(rabbitmq_config)
+
+        detections_config = RabbitMQ_Config(
+            url=EngineConfig.RABBITMQ_URL,
+            exchange=EngineConfig.RABBITMQ_DETECTIONS_EXCHANGE,
+            queue=EngineConfig.RABBITMQ_DETECTIONS_QUEUE,
+            routing_key=EngineConfig.RABBITMQ_DETECTIONS_ROUTING_KEY,
+        )
+        self.detections_rmq = RabbitMQ_Client(detections_config)
         
-        # Set up process pool
         self.pool = mp.Pool(
             processes=self.num_workers,
             initializer=init_worker
         )
         
-        # Set up signal handling for graceful shutdown
         signal.signal(signal.SIGINT, self.handle_shutdown)
         signal.signal(signal.SIGTERM, self.handle_shutdown)
 
@@ -316,13 +320,16 @@ class QueueConsumer:
                     normal, problems = self.process_batch(batch)
                     
                     if len(problems) > 0:
-                        # Delete successfully processed records
-                        # deleted = self.redis_queue.delete_fetched_records(successful)
                         logging.debug(f"Detected {len(problems)} problems")
                         
                         for problem in problems:
                             logging.debug(problem)
                             self.rabbitmq_client.send_message(problem)
+
+                            try:
+                                self.detections_rmq.send_message(problem)
+                            except Exception as e:
+                                logging.error(f"Failed to publish detection to SaaS queue: {e}")
                     
                     # if failed:
                     #     logging.info(f"Failed to process {len(failed)} records")

@@ -14,6 +14,7 @@ from typing import Dict, Any, Optional, Tuple, Deque
 from collections import defaultdict, deque
 import pika
 from pika.exchange_type import ExchangeType
+import redis
 from configs import EngineConfig, RabbitMQ_Config, RabbitMQ_URLParameters
 from redis_ip_queue import IPQueue
 from redis_ts_queue import TimeseriesQueue
@@ -802,14 +803,113 @@ class RabbitMQ_Client:
             self.connection = None
 
 
+class ApiKeyValidator:
+    """Validates API keys from syslog tags against Redis cache.
+    
+    Cache schema (Redis hash per key):
+        dk7:key:<plaintext_key> -> JSON {user_id, domain_id, host, strip_subdomains, origin_ips, max_rps}
+    """
+
+    TAG_PREFIX = "dk7_"
+
+    def __init__(self):
+        self.client = redis.Redis(
+            host=EngineConfig.REDIS_APIKEY_SERVER,
+            port=EngineConfig.REDIS_APIKEY_PORT,
+            username=EngineConfig.REDIS_APIKEY_USER or None,
+            password=EngineConfig.REDIS_APIKEY_PASS or None,
+            db=EngineConfig.REDIS_APIKEY_DB,
+            decode_responses=True,
+        )
+        self.cache_prefix = EngineConfig.REDIS_APIKEY_PREFIX
+        self.rps_prefix = EngineConfig.REDIS_APIKEY_RPS_PREFIX
+        logging.info("ApiKeyValidator: connected to Redis for API key cache")
+
+    # ------------------------------------------------------------------ cache
+    def lookup(self, plaintext_key: str) -> Optional[Dict[str, Any]]:
+        raw = self.client.get(f"{self.cache_prefix}:{plaintext_key}")
+        if raw is None:
+            return None
+        return json.loads(raw)
+
+    # ----------------------------------------------------------- extract tag
+    @staticmethod
+    def extract_key_from_tag(tag_str: str) -> Optional[str]:
+        if tag_str and tag_str.startswith(ApiKeyValidator.TAG_PREFIX):
+            return tag_str
+        return None
+
+    # --------------------------------------------------------- host matching
+    @staticmethod
+    def strip_subdomains(domain: str) -> str:
+        parts = domain.lower().strip(".").split(".")
+        if len(parts) > 2:
+            return ".".join(parts[-2:])
+        return ".".join(parts)
+
+    @staticmethod
+    def host_matches(log_domain: str, registered_host: str, do_strip: bool) -> bool:
+        log_domain = log_domain.lower().strip(".")
+        registered_host = registered_host.lower().strip(".")
+        if do_strip:
+            log_domain = ApiKeyValidator.strip_subdomains(log_domain)
+        return log_domain == registered_host
+
+    # ---------------------------------------------------- source IP binding
+    @staticmethod
+    def source_ip_allowed(client_ip: str, origin_ips: list) -> bool:
+        if not origin_ips:
+            return True
+        return client_ip in origin_ips
+
+    # ------------------------------------------------------- RPS rate limit
+    def check_rps(self, plaintext_key: str, max_rps: int) -> bool:
+        if max_rps <= 0:
+            return True
+        rps_key = f"{self.rps_prefix}:{plaintext_key}"
+        current = self.client.incr(rps_key)
+        if current == 1:
+            self.client.expire(rps_key, 1)
+        return current <= max_rps
+
+    # --------------------------------------------------------- full chain
+    def validate(self, tag: str, log_domain: str, client_ip: str) -> Optional[Dict[str, Any]]:
+        """Run the full validation chain. Returns key metadata on success, None on reject."""
+        api_key = self.extract_key_from_tag(tag)
+        if api_key is None:
+            return None
+
+        meta = self.lookup(api_key)
+        if meta is None:
+            logging.debug(f"ApiKeyValidator: unknown key {tag[:12]}...")
+            return None
+
+        if not self.host_matches(log_domain, meta["host"], meta.get("strip_subdomains", False)):
+            logging.debug(f"ApiKeyValidator: host mismatch {log_domain} vs {meta['host']}")
+            return None
+
+        if not self.source_ip_allowed(client_ip, meta.get("origin_ips", [])):
+            logging.debug(f"ApiKeyValidator: source IP {client_ip} not in origin_ips")
+            return None
+
+        if not self.check_rps(api_key, meta.get("max_rps", 0)):
+            logging.debug(f"ApiKeyValidator: RPS exceeded for key {tag[:12]}...")
+            return None
+
+        return meta
+
+
 class SyslogMessage:
     """Class to parse and store syslog message components"""
     
+    TAG_PATTERN = re.compile(r'^(\S+?)[\[:]')
+
     def __init__(self, raw_message: str):
         self.raw_message = raw_message
         self.priority: Optional[int] = None
         self.timestamp: Optional[datetime] = None
         self.hostname: str = ""
+        self.tag: str = ""
         self.message: str = ""
         self.client_address: str = ""
         self.json_data: Optional[Dict[str, Any]] = None
@@ -826,14 +926,10 @@ class SyslogMessage:
             if match:
                 self.priority = int(match.group(1))
                 self.timestamp = datetime.now(tz=EngineConfig.TZ_OFFSET)
-                """ self.timestamp = datetime.strptime(
-                    f"{datetime.now().year} {match.group(2)}", 
-                    "%Y %b %d %H:%M:%S"
-                ) """
                 self.hostname = match.group(3)
                 self.message = match.group(4)
                 
-                # Try to extract JSON from the message
+                self._extract_tag()
                 self.extract_json()
             else:
                 logging.warning(f"Could not parse message: {self.raw_message}")
@@ -842,6 +938,16 @@ class SyslogMessage:
             logging.error(f"Error parsing message: {str(e)}")
             logging.error(traceback.format_exc())
             raise
+
+    def _extract_tag(self) -> None:
+        """Extract the syslog tag (app name) from the message field.
+        
+        Nginx syslog format: ``<pri>timestamp host TAG[PID]: payload``
+        or ``TAG: payload``.  The tag is the first token before ``[`` or ``:``.
+        """
+        tag_match = self.TAG_PATTERN.match(self.message)
+        if tag_match:
+            self.tag = tag_match.group(1)
 
 
     def extract_json(self) -> None:
@@ -990,7 +1096,8 @@ class MessageProcessor:
                 cipl: Optional[IPQueue] = None,
                 ip2location: Optional[IP2LocationDetector] = None,
                 known_bots: Optional[FastIPSubnetChecker] = None,
-                ip2hostname: Optional[IP2Hostname] = None):
+                ip2hostname: Optional[IP2Hostname] = None,
+                api_key_validator: Optional[ApiKeyValidator] = None):
         
         self.message_queue = message_queue
         self.ts_queue = ts_queue
@@ -998,8 +1105,10 @@ class MessageProcessor:
         self.ip2location = ip2location
         self.known_bots = known_bots
         self.ip2hostname = ip2hostname
+        self.api_key_validator = api_key_validator
         
         self.counter = 0
+        self.rejected = 0
         self.buffer_limit_logs = EngineConfig.SYSLOG_SERVER_BUFFER_LIMIT_LOGS
         self.buffer_limit_queue = EngineConfig.SYSLOG_SERVER_BUFFER_LIMIT_QUEUE
         self.last_buffer_flush_timeout = 3
@@ -1021,7 +1130,6 @@ class MessageProcessor:
             
     
     def setup_rabbitmq(self):
-        # Configure RabbitMQ if URL provided
         rabbitmq_config = RabbitMQ_Config(
             url=EngineConfig.RABBITMQ_URL,
             exchange=EngineConfig.RABBITMQ_SYSLOG_EXCHANGE,
@@ -1029,6 +1137,14 @@ class MessageProcessor:
             routing_key=EngineConfig.RABBITMQ_SYSLOG_ROUTING_KEY
         )
         self.rabbitmq_client = RabbitMQ_Client(rabbitmq_config)
+
+        domain_logs_config = RabbitMQ_Config(
+            url=EngineConfig.RABBITMQ_URL,
+            exchange=EngineConfig.RABBITMQ_DOMAIN_LOGS_EXCHANGE,
+            queue=EngineConfig.RABBITMQ_DOMAIN_LOGS_QUEUE,
+            routing_key=EngineConfig.RABBITMQ_DOMAIN_LOGS_ROUTING_KEY,
+        )
+        self.domain_logs_rmq = RabbitMQ_Client(domain_logs_config)
     
     
     def has_static_content(self, uri: str) -> bool:
@@ -1062,75 +1178,71 @@ class MessageProcessor:
         return self.decode_message(data, encoding='latin1')
     
     
-    def process_messages (self):
+    def process_messages(self):
         """Worker function to process messages from queue"""
         while True:
             try:
                 client_address, data = self.message_queue.get()
                 message = self.decode_message(data)
+                ip = None
                 
                 try:
-                    # Create SyslogMessage instance
                     syslog_msg = SyslogMessage(message)
-                    syslog_msg.client_address = client_address # IP OF SERVER SENDING LOGS
+                    syslog_msg.client_address = client_address
+
+                    if syslog_msg.json_data is None:
+                        continue
+
                     syslog_msg.json_data['client_address'] = client_address
-                    ip = syslog_msg.json_data['remote_addr'] # IP OF VIRTUAL DOMAIN VISITOR
-                    
-                    # SINGLE SOURCE OF TIMESTAMP
+                    ip = syslog_msg.json_data['remote_addr']
+
+                    # ---- API KEY VALIDATION CHAIN ----
+                    key_meta = None
+                    domain_id = None
+
+                    if self.api_key_validator and syslog_msg.tag:
+                        log_domain = syslog_msg.json_data.get('domain', '')
+                        key_meta = self.api_key_validator.validate(syslog_msg.tag, log_domain, client_address)
+
+                        if key_meta is None:
+                            self.rejected += 1
+                            if self.rejected % 1000 == 0:
+                                logging.warning(f"ApiKey rejected total: {self.rejected}")
+                            continue
+
+                        domain_id = key_meta['domain_id']
+
+                    # ---- ENRICHMENT ----
+
                     syslog_msg.json_data['timestamp'] = syslog_msg.timestamp.timestamp()
 
-                    # STATIC ASSETS
                     syslog_msg.json_data['is_static'] = self.has_static_content(syslog_msg.json_data.get('request'))
                     
-                    # URL, METHOD, PROTOCOL
-                    request = syslog_msg.json_data.get('request').split(' ') if syslog_msg.json_data.get('request') else None
-                    syslog_msg.json_data['http_method']     = request[0] if request else None
-                    syslog_msg.json_data['http_uri']        = request[1] if request else None
-                    syslog_msg.json_data['http_protocol']   = request[2] if request else None
+                    request = syslog_msg.json_data.get('request', '').split(' ') if syslog_msg.json_data.get('request') else None
+                    syslog_msg.json_data['http_method']   = request[0] if request else None
+                    syslog_msg.json_data['http_uri']      = request[1] if request else None
+                    syslog_msg.json_data['http_protocol'] = request[2] if request and len(request) > 2 else None
                     
-                    # PTR HOSTNAME
-                    # syslog_msg.json_data['ptr'] = self.ip2hostname.detect(ip)
-                    
-                    # IP2LOCATION
                     ip2location = self.ip2location.detect(ip)
                     syslog_msg.json_data['ip2location'] = ip2location
                     syslog_msg.json_data['country'] = ip2location['country'] if ip2location else 'NA'
                     syslog_msg.json_data['city'] = ip2location['city'] if ip2location else 'NA'
 
-                    # IS KNOWN BOT
                     bot_name, bot_category, bot_support = self.known_bots.detect(ip)
                     syslog_msg.json_data['bot_name'] = bot_name
                     syslog_msg.json_data['bot_category'] = bot_category
                     syslog_msg.json_data['bot_support'] = bot_support
-                    
-                    # if bot_name:
-                    #     logging.debug(f'{ip} | {bot_name} | {bot_type}')
-                    
-                    # buffer_size_queue = len(self.buffer['queue'])
-                    
-                    # if buffer_size % 100 == 0:
-                    #     logging.debug(f"#{self.counter} | Buffer size: {buffer_size}")
-                    
-                    # REDIS QUEUE #
-                    
-                    # SKIP STATIC CONTENT AND KNOWN BOTS
+
+                    if domain_id is not None:
+                        syslog_msg.json_data['domain_id'] = domain_id
+
+                    # ---- REDIS TS QUEUE (for ML pipeline) ----
+
                     if  (not syslog_msg.json_data['is_static'] and not syslog_msg.json_data['bot_support']) and \
                         (self.ts_queue and not self.cipl.contains(ip)):
-                        # PUSH TO TS QUEUE
                         self.ts_queue.push(ip, syslog_msg.json_data)
-                        # ADD TO BUFFER FOR LATER BATCH PUSH
-                        # self.buffer['queue'].append((ip, syslog_msg.json_data))
-
-                    # REDIS TIMESERIESQUEUE BATCH PUSH
-                    """ if buffer_size_queue >= self.buffer_limit_queue:
-                        with self.lock:
-                            flush_buffer = self.buffer['queue']
-                            self.buffer['queue'] = []
-                            self.ts_queue.batch_push(flush_buffer)
-                            logging.info(f"TS QUEUE FLUSH: {buffer_size_queue}")
-                    """
                     
-                    # RABBIT MQ #
+                    # ---- RABBITMQ: existing Graylog/syslog queue ----
                     
                     message_data = {
                         "timestamp": syslog_msg.timestamp.timestamp(),
@@ -1142,26 +1254,44 @@ class MessageProcessor:
                         "is_static": False,
                     }
                     
-                    # Add JSON data if present
                     if syslog_msg.json_data:
                         message_data.update(syslog_msg.json_data)
                     
                     with self.lock:
                         self.buffer['logs'].append(message_data)
                         
-                        # Forward to RabbitMQ
                         buffer_size_logs = len(self.buffer['logs'])
                         buffer_flush_size_trigger = buffer_size_logs >= self.buffer_limit_logs
                         buffer_flush_time_trigger = time.time() - self.last_buffer_flush >= self.last_buffer_flush_timeout
                         
                         if buffer_flush_size_trigger or buffer_flush_time_trigger:
-                            for message in self.buffer['logs']:
-                                self.rabbitmq_client.send_message(message)
+                            for msg in self.buffer['logs']:
+                                self.rabbitmq_client.send_message(msg)
                             
                             self.buffer['logs'] = []
                             self.last_buffer_flush = time.time()
                             logging.info(f"WID: {threading.current_thread().name} | FLUSH: {buffer_size_logs}")
-                            
+
+                    # ---- RABBITMQ: domain_logs queue (for SaaS DB writer) ----
+
+                    if domain_id is not None:
+                        domain_log_msg = {
+                            "domain_id": domain_id,
+                            "timestamp": syslog_msg.timestamp.isoformat(),
+                            "source_ip": ip,
+                            "method": syslog_msg.json_data.get('http_method', ''),
+                            "path": syslog_msg.json_data.get('http_uri', ''),
+                            "status_code": int(syslog_msg.json_data.get('response_status', 0)),
+                            "bytes_sent": int(syslog_msg.json_data.get('body_bytes_sent', 0)),
+                            "request_time": float(syslog_msg.json_data.get('request_time', 0)),
+                            "country": syslog_msg.json_data.get('country'),
+                            "city": syslog_msg.json_data.get('city'),
+                        }
+                        try:
+                            self.domain_logs_rmq.send_message(domain_log_msg)
+                        except Exception as e:
+                            logging.error(f"Failed to publish domain_log: {e}")
+
                 except Exception as e:
                     logging.error(f"Error processing message from {ip}: {e}")
                     
@@ -1183,9 +1313,9 @@ def start_server(
     cipl: Optional[IPQueue] = None,
     ip2location: Optional[IP2LocationDetector] = None,
     known_bots: Optional[FastIPSubnetChecker] = None,
-    # ip2hostname: Optional[IP2Hostname] = None,
     ip2hostname: Optional[IP2Hostname_V2] = None,
-    rate_limiter: Optional[RateLimiter] = None
+    rate_limiter: Optional[RateLimiter] = None,
+    api_key_validator: Optional[ApiKeyValidator] = None,
 ) -> None:
     """Start the syslog server"""
     server = None
@@ -1193,9 +1323,8 @@ def start_server(
     try:
         server = ThreadedSyslogServer((host, port), SyslogHandler, message_queue, rate_limiter)
         sock = server.socket
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144) # Increase OS buffer size for UDP socket, 256KB buffer
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
         
-        # Initialize and start processor
         processor = MessageProcessor(
             message_queue=message_queue, 
             ts_queue=ts_queue, 
@@ -1203,6 +1332,7 @@ def start_server(
             ip2location=ip2location, 
             known_bots=known_bots,
             ip2hostname=ip2hostname,
+            api_key_validator=api_key_validator,
         )
         processor.start_workers(num_workers)
         
@@ -1229,10 +1359,8 @@ if __name__ == "__main__":
     message_queue = MessageQueue.Queue(maxsize=100000)
     ts_queue = TimeseriesQueue()
     cipl = IPQueue()
-    # ip2hostname = IP2Hostname()
     ip2hostname = IP2Hostname_V2()
     
-    # IP INFO
     known_bots  = FastIPSubnetChecker(
         ips_directory   = EngineConfig.KNOWN_BOTS_IPS_FOLDER,
         cache_file      = EngineConfig.KNOWN_BOTS_CACHE_FILE
@@ -1244,8 +1372,8 @@ if __name__ == "__main__":
     )
     
     rate_limiter = RateLimiter(requests_per_second=1000)
+    api_key_validator = ApiKeyValidator()
     
-    # Start the server
     start_server(
         host=EngineConfig.SYSLOG_SERVER_LISTEN,
         port=EngineConfig.SYSLOG_SERVER_PORT,
@@ -1255,7 +1383,8 @@ if __name__ == "__main__":
         ip2location=ip2location,
         known_bots=known_bots,
         ip2hostname=ip2hostname,
-        rate_limiter=rate_limiter
+        rate_limiter=rate_limiter,
+        api_key_validator=api_key_validator,
     )
 
     """
