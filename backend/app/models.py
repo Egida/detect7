@@ -126,8 +126,8 @@ class ApiKey(Base):
 class DomainLog(Base):
     __tablename__ = "domain_logs"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
     domain_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     source_ip: Mapped[str] = mapped_column(String(45), nullable=False)
     method: Mapped[str] = mapped_column(String(10), nullable=False)
@@ -137,6 +137,8 @@ class DomainLog(Base):
     request_time: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     country: Mapped[str | None] = mapped_column(String(2), nullable=True)
     city: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    is_known_bot: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    bot_name: Mapped[str | None] = mapped_column(String(50), nullable=True)
 
 
 # ---------------------------------------------------------------------------
@@ -146,8 +148,8 @@ class DomainLog(Base):
 class DetectionEvent(Base):
     __tablename__ = "detection_events"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
     domain_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     detected_ip: Mapped[str] = mapped_column(String(45), nullable=False, index=True)
     threat_score: Mapped[float] = mapped_column(Float, nullable=False)

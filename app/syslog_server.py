@@ -1286,6 +1286,8 @@ class MessageProcessor:
                             "request_time": float(syslog_msg.json_data.get('request_time', 0)),
                             "country": syslog_msg.json_data.get('country'),
                             "city": syslog_msg.json_data.get('city'),
+                            "is_known_bot": bool(syslog_msg.json_data.get('bot_name')),
+                            "bot_name": (syslog_msg.json_data.get('bot_name') or '')[:50] or None,
                         }
                         try:
                             self.domain_logs_rmq.send_message(domain_log_msg)

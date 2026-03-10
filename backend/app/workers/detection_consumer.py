@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import signal
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pika
 from sqlalchemy import text
@@ -50,11 +50,11 @@ def _write_event(msg: dict) -> None:
     try:
         ts_raw = msg.get("timestamp")
         if isinstance(ts_raw, (int, float)):
-            started_at = datetime.utcfromtimestamp(ts_raw)
+            started_at = datetime.fromtimestamp(ts_raw, tz=timezone.utc).replace(tzinfo=None)
         elif isinstance(ts_raw, str):
             started_at = datetime.fromisoformat(ts_raw)
         else:
-            started_at = datetime.utcnow()
+            started_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
         row = {
             "started_at": started_at,

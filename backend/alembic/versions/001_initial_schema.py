@@ -90,10 +90,12 @@ def upgrade() -> None:
     )
 
     # --- domain_logs (will become hypertable) ---
+    # Composite PK (id, timestamp) required by TimescaleDB -- partitioning
+    # column must be part of any unique constraint.
     op.create_table(
         "domain_logs",
-        sa.Column("id", sa.Integer, primary_key=True),
-        sa.Column("timestamp", sa.DateTime, nullable=False, index=True),
+        sa.Column("id", sa.Integer, autoincrement=True, nullable=False),
+        sa.Column("timestamp", sa.DateTime, nullable=False),
         sa.Column("domain_id", sa.Integer, nullable=False, index=True),
         sa.Column("source_ip", sa.String(45), nullable=False),
         sa.Column("method", sa.String(10), nullable=False),
@@ -103,13 +105,15 @@ def upgrade() -> None:
         sa.Column("request_time", sa.Float, nullable=False, server_default="0"),
         sa.Column("country", sa.String(2), nullable=True),
         sa.Column("city", sa.String(100), nullable=True),
+        sa.PrimaryKeyConstraint("id", "timestamp"),
     )
 
     # --- detection_events (will become hypertable) ---
+    # Composite PK (id, started_at) required by TimescaleDB.
     op.create_table(
         "detection_events",
-        sa.Column("id", sa.Integer, primary_key=True),
-        sa.Column("started_at", sa.DateTime, nullable=False, index=True),
+        sa.Column("id", sa.Integer, autoincrement=True, nullable=False),
+        sa.Column("started_at", sa.DateTime, nullable=False),
         sa.Column("domain_id", sa.Integer, nullable=False, index=True),
         sa.Column("detected_ip", sa.String(45), nullable=False, index=True),
         sa.Column("threat_score", sa.Float, nullable=False),
@@ -125,6 +129,7 @@ def upgrade() -> None:
         sa.Column("ended_at", sa.DateTime, nullable=True),
         sa.Column("cf_pushed_at", sa.DateTime, nullable=True),
         sa.Column("cf_expires_at", sa.DateTime, nullable=True),
+        sa.PrimaryKeyConstraint("id", "started_at"),
     )
 
     # --- domain_origin_ips ---

@@ -32,9 +32,9 @@ FLUSH_INTERVAL_SEC = float(os.getenv("LOG_WRITER_FLUSH_INTERVAL", "2.0"))
 
 INSERT_SQL = text("""
     INSERT INTO domain_logs
-        (timestamp, domain_id, source_ip, method, path, status_code, bytes_sent, request_time, country, city)
+        (timestamp, domain_id, source_ip, method, path, status_code, bytes_sent, request_time, country, city, is_known_bot, bot_name)
     VALUES
-        (:timestamp, :domain_id, :source_ip, :method, :path, :status_code, :bytes_sent, :request_time, :country, :city)
+        (:timestamp, :domain_id, :source_ip, :method, :path, :status_code, :bytes_sent, :request_time, :country, :city, :is_known_bot, :bot_name)
 """)
 
 _shutdown = False
@@ -87,6 +87,8 @@ def main() -> None:
                 "request_time": float(msg.get("request_time", 0)),
                 "country": (msg.get("country") or "")[:2] or None,
                 "city": (msg.get("city") or "")[:100] or None,
+                "is_known_bot": bool(msg.get("is_known_bot", False)),
+                "bot_name": (msg.get("bot_name") or "")[:50] or None,
             })
         except Exception:
             logger.exception("Bad message, skipping")

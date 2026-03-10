@@ -102,7 +102,6 @@ class ApiKeyPublic(BaseModel):
 
 
 class ApiKeyCreated(ApiKeyPublic):
-    """Returned only on creation -- includes full plaintext key."""
     plaintext_key: str
 
 
@@ -154,12 +153,31 @@ class WhitelistedIPPublic(BaseModel):
 class TimeseriesPoint(BaseModel):
     t: str
     requests: int
-    problems: int
+    bots: int = 0
+    problems: int = 0
 
 
 class NamedCount(BaseModel):
     name: str
     count: int
+    bot_count: int = 0
+
+
+class ProblemIP(BaseModel):
+    timestamp: str
+    domain_name: str | None = None
+    detected_ip: str
+    country: str | None
+    ptr: str | None
+    peak_rps: float
+    request_count: int
+
+
+class DomainCount(BaseModel):
+    domain_id: int
+    domain_name: str
+    count: int
+    bot_count: int = 0
 
 
 class RecentDetection(BaseModel):
@@ -173,6 +191,7 @@ class RecentDetection(BaseModel):
 
 class DashboardSummary(BaseModel):
     total_requests_5m: int
+    total_bots_5m: int = 0
     suspicious_events_5m: int
     max_rps_5m: float
     current_rps: float
@@ -181,3 +200,22 @@ class DashboardSummary(BaseModel):
     top_problem_paths: list[NamedCount]
     timeline: list[TimeseriesPoint]
     recent_detections: list[RecentDetection]
+    problems_timeline: list[TimeseriesPoint] = []
+    problems_rps_timeline: list[TimeseriesPoint] = []
+    response_statuses: list[NamedCount] = []
+    problem_ips: list[ProblemIP] = []
+
+
+class OverviewDashboard(BaseModel):
+    timeline: list[TimeseriesPoint]
+    top_domains_by_requests: list[DomainCount]
+    top_domains_by_problems: list[DomainCount]
+    top_countries: list[NamedCount]
+    unique_visitors_by_domain: list[DomainCount]
+    problems_timeline: list[TimeseriesPoint]
+    problems_rps_timeline: list[TimeseriesPoint]
+    problem_ips: list[ProblemIP]
+    total_requests: int
+    total_bots: int = 0
+    total_problems: int
+    current_rps: float

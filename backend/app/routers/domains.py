@@ -58,7 +58,10 @@ def _build_key_cache_meta(domain: Domain, user: User, db: Session) -> dict:
 
 def _push_key_to_cache(plaintext_key: str, domain: Domain, user: User, db: Session) -> None:
     meta = _build_key_cache_meta(domain, user, db)
-    set_api_key_cache(plaintext_key, meta)
+    try:
+        set_api_key_cache(plaintext_key, meta)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +134,10 @@ def delete_domain(
     for ak in domain.api_keys:
         try:
             pt = decrypt_value(ak.key_enc)
-            delete_api_key_cache(pt)
+            try:
+                delete_api_key_cache(pt)
+            except Exception:
+                pass
         except Exception:
             pass
 
