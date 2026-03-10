@@ -1,0 +1,11 @@
+:root {
+  color-scheme: light;
+}
+
+body {
+  background: #f6f8fb;
+}
+
+.hero-bg {
+  background: radial-gradient(circle at top right, #182848, #0f172a 45%, #0a0f1f);
+}
